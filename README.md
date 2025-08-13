@@ -1,13 +1,3 @@
-You’ve got two separate issues in that README:
-
-1. **Mermaid parse error:** your node `J[Estimate mph (optional calibration)]` mixes `[]` (rectangle) with **unescaped parentheses** inside the label. GitHub’s Mermaid parser chokes on that. Easiest fix: remove the inner parentheses (or switch the node to a round shape `J(Estimate mph – optional calibration)`).
-
-2. **Weird �/control chars (“”)** in a few places (e.g., `pixelsfeet`, the file tree). Those are stray non-UTF-8/control bytes. Replace with clean UTF-8 (or plain ASCII).
-
-I’ve cleaned those up, fixed the filename in the tree (`smartway_counter.py`), and adjusted the Mermaid block. Drop this in as your **README.md**:
-
----
-
 # TDOT SmartWay – Nearby Camera Counting & Real-Time Speed Charting
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](#license)
@@ -250,19 +240,33 @@ requests
 
 ```mermaid
 flowchart TD
-    A[Load SmartWay config.prod.json] -->|apiBaseUrl, apiKey| B(Session with retries)
-    B --> C[Fetch RoadwayCameras]
-    C --> D[Filter/normalize cameras]
-    D --> E[Nearest cameras by Haversine]
-    E --> F[OpenCV video stream]
-    F --> G[Background subtractor + morphology]
-    G --> H[Centroid tracker + histories]
-    H --> I[Crossing detection vs lines A/B]
-    I --> J[Estimate mph - optional calibration]
-    I --> K[Counts A/B (cumulative)]
-    J --> L[Running averages + fastest]
-    K --> M[Live Matplotlib chart]
-    L --> M
+  A[Load SmartWay config.prod.json]
+  B[Session with retries]
+  C[Fetch RoadwayCameras]
+  D[Normalize cameras]
+  E[Nearest cameras by Haversine]
+  F[OpenCV video stream]
+  G[Background subtraction + morphology]
+  H[Centroid tracker + histories]
+  I[Crossing detection vs lines A and B]
+  J[Estimate mph - optional calibration]
+  K[Counts A and B - cumulative]
+  L[Running averages and fastest]
+  M[Live Matplotlib chart]
+
+  A -->|apiBaseUrl + apiKey| B
+  B --> C
+  C --> D
+  D --> E
+  E --> F
+  F --> G
+  G --> H
+  H --> I
+  I --> J
+  I --> K
+  J --> L
+  K --> M
+  L --> M
 ```
 
 ---
