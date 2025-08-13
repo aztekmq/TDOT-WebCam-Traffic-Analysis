@@ -1,13 +1,3 @@
-You’ve got two separate issues in that README:
-
-1. **Mermaid parse error:** your node `J[Estimate mph (optional calibration)]` mixes `[]` (rectangle) with **unescaped parentheses** inside the label. GitHub’s Mermaid parser chokes on that. Easiest fix: remove the inner parentheses (or switch the node to a round shape `J(Estimate mph – optional calibration)`).
-
-2. **Weird �/control chars (“”)** in a few places (e.g., `pixelsfeet`, the file tree). Those are stray non-UTF-8/control bytes. Replace with clean UTF-8 (or plain ASCII).
-
-I’ve cleaned those up, fixed the filename in the tree (`smartway_counter.py`), and adjusted the Mermaid block. Drop this in as your **README.md**:
-
----
-
 # TDOT SmartWay – Nearby Camera Counting & Real-Time Speed Charting
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](#license)
