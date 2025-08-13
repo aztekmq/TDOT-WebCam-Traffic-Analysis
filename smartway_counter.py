@@ -48,6 +48,11 @@ Change History
                 - Force interactive Matplotlib backend (TkAgg/Qt5Agg) before pyplot import
                 - Call plt.show(block=False) after creating figure
                 - Flush GUI events each update; set window title
+2025-08-13  RL  Performance architecture:
+                - Add FrameReader thread to decouple cap.read()
+                - Add LiveStats (thread-safe) for counts/speeds
+                - Make chart timer-driven (polls stats; no per-frame mpl work)
+                - Integrate threading path into main loop
 """
 
 from __future__ import annotations
@@ -63,6 +68,7 @@ from typing import Dict, List, Optional, Tuple, Any
 import cv2
 import numpy as np
 import requests
+import threading, queue
 from requests.adapters import HTTPAdapter, Retry
 from urllib.parse import urljoin
 
@@ -316,13 +322,6 @@ def fetch_cameras(debug_key: bool = False, allow_cache_fallback: bool = True) ->
     Retries multiple auth styles, handles 204/empty responses with cache-busting,
     and adds $format=json fallback if needed. If all attempts fail and a cached
     inventory exists, returns the cached inventory.
-
-    Parameters
-    ----------
-    debug_key : bool
-        Verbose logs for key/config/fetch flow.
-    allow_cache_fallback : bool
-        If True, load last-good camera list from cache when live fetch fails.
     """
     import json
 
@@ -345,11 +344,9 @@ def fetch_cameras(debug_key: bool = False, allow_cache_fallback: bool = True) ->
             ]
         attempts.append(({}, {}, "no-key"))
 
-        # Try each attempt; if payload isn't JSON, retry once with $format=json
         for params, extra_hdrs, label in attempts:
             hdrs = dict(s.headers)
             hdrs.update(extra_hdrs)
-
             try:
                 if debug_key:
                     print(f"[cams] GET {url} params={params} ({label})")
@@ -363,7 +360,7 @@ def fetch_cameras(debug_key: bool = False, allow_cache_fallback: bool = True) ->
                     for _ in range(2):  # up to 2 extra tries
                         time.sleep(0.6)
                         p2 = dict(params)
-                        p2["_"] = str(int(time.time() * 1000))  # cache-buster query param
+                        p2["_"] = str(int(time.time() * 1000))  # cache-buster
                         r2 = s.get(url, timeout=30, params=p2, headers=hdrs)
                         if r2.status_code not in (204,) and (r2.text or r2.content):
                             r = r2
@@ -372,7 +369,6 @@ def fetch_cameras(debug_key: bool = False, allow_cache_fallback: bool = True) ->
                     if not tried_nonempty and debug_key:
                         print(f"[cams] Still empty after cache-buster tries.")
 
-                # auth/permission handling
                 if r.status_code in (401, 403):
                     if params or extra_hdrs:
                         if debug_key:
@@ -384,33 +380,28 @@ def fetch_cameras(debug_key: bool = False, allow_cache_fallback: bool = True) ->
                         fresh = get_tdot_api_key(debug=debug_key, force_refresh=True)
                         if fresh and fresh != api_key:
                             api_key = fresh
-                            # restart attempts with fresh key
-                            break
+                            break  # restart attempts with fresh key
                     last_err = requests.HTTPError(f"{r.status_code} {r.reason}")
                     continue
 
                 r.raise_for_status()
 
                 items = _decode_json_or_log(r, debug_key, r.url)
-                if items is None:
-                    # one more try with $format=json
-                    if "$format" not in params:
-                        p2 = dict(params)
-                        p2["$format"] = "json"
-                        if debug_key:
-                            print(f"[cams] Retrying with $format=json → {url} params={p2} ({label}+format)")
-                        r2 = s.get(url, timeout=30, params=p2, headers=hdrs)
-                        if r2.status_code in (401, 403):
-                            last_err = requests.HTTPError(f"{r2.status_code} {r2.reason}")
-                            continue
-                        r2.raise_for_status()
-                        items = _decode_json_or_log(r2, debug_key, r2.url)
+                if items is None and "$format" not in params:
+                    p2 = dict(params); p2["$format"] = "json"
+                    if debug_key:
+                        print(f"[cams] Retrying with $format=json → {url} params={p2} ({label}+format)")
+                    r2 = s.get(url, timeout=30, params=p2, headers=hdrs)
+                    if r2.status_code in (401, 403):
+                        last_err = requests.HTTPError(f"{r2.status_code} {r2.reason}")
+                        continue
+                    r2.raise_for_status()
+                    items = _decode_json_or_log(r2, debug_key, r2.url)
 
                 if items is None:
                     last_err = ValueError("Non-JSON or empty response")
                     continue
 
-                # Success
                 if not isinstance(items, list):
                     last_err = ValueError(f"Unexpected JSON shape: {type(items)}")
                     continue
@@ -428,7 +419,6 @@ def fetch_cameras(debug_key: bool = False, allow_cache_fallback: bool = True) ->
         if raw_items:
             break  # success for this base
 
-    # Cache or fallback
     if raw_items:
         _write_cams_cache(raw_items, debug=debug_key)
     else:
@@ -472,6 +462,70 @@ def fetch_cameras(debug_key: bool = False, allow_cache_fallback: bool = True) ->
     return out
 
 # --------------------------------------------------------------------
+# Frame reader (producer) thread
+# --------------------------------------------------------------------
+
+class FrameReader:
+    """Continuously grab frames in a background thread; keeps only the newest frame."""
+    def __init__(self, cap: cv2.VideoCapture, max_queue: int = 1):
+        self.cap = cap
+        self.q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=max_queue)
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._t.start()
+        return self
+
+    def _run(self):
+        while not self._stop.is_set():
+            ok, frame = self.cap.read()
+            if not ok:
+                time.sleep(0.05)
+                continue
+            if self.q.full():
+                try: self.q.get_nowait()
+                except queue.Empty: pass
+            try: self.q.put_nowait(frame)
+            except queue.Full:
+                pass
+
+    def get(self, timeout: float = 0.02):
+        """Return latest frame or None if not available quickly."""
+        try:
+            return self.q.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def stop(self):
+        self._stop.set()
+        self._t.join(timeout=1.0)
+
+# --------------------------------------------------------------------
+# Thread-safe stats for the chart
+# --------------------------------------------------------------------
+
+class LiveStats:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.cum = {"A":0, "B":0, "sumA":0.0, "sumB":0.0, "nA":0, "nB":0, "fastA":None, "fastB":None}
+
+    def add_crossing(self, dirkey: str, mph: Optional[float]):
+        with self.lock:
+            self.cum[dirkey] += 1
+            if mph is not None:
+                key_sum = "sumA" if dirkey=="A" else "sumB"
+                key_n   = "nA"   if dirkey=="A" else "nB"
+                key_f   = "fastA"if dirkey=="A" else "fastB"
+                self.cum[key_sum] += mph
+                self.cum[key_n]   += 1
+                self.cum[key_f]    = mph if self.cum[key_f] is None else max(self.cum[key_f], mph)
+
+    def snapshot(self):
+        with self.lock:
+            return dict(self.cum)
+
+# --------------------------------------------------------------------
 # Lightweight tracker & speed helpers
 # --------------------------------------------------------------------
 
@@ -480,7 +534,6 @@ class CentroidTracker:
     Very simple centroid tracker for low-density scenes.
     Assigns IDs, matches by nearest centroid, tracks short histories.
     """
-
     def __init__(self, max_lost: int = 20) -> None:
         self.next_id = 1
         self.objects: Dict[int, Tuple[int, int]] = {}  # id -> (cx, cy)
@@ -489,13 +542,8 @@ class CentroidTracker:
         self.history: Dict[int, deque] = {}            # id -> deque of (t, x, y)
 
     def update(self, detections: List[Tuple[int, int, int, int]], ts: float):
-        """
-        detections: list of (x, y, w, h)
-        ts: current timestamp (seconds)
-        """
         centroids = [(int(x + w / 2), int(y + h / 2)) for (x, y, w, h) in detections]
-
-        used_objs, used_dets = set(), set()
+        used_dets = set()
         matches: List[Tuple[int, int]] = []
 
         # Greedy nearest matching
@@ -507,18 +555,16 @@ class CentroidTracker:
                 dist = (ox - cx) ** 2 + (oy - cy) ** 2
                 if dist < best_dist:
                     best_dist, best_j = dist, j
-            if best_j is not None and best_dist < 80 ** 2:  # max jump limit
+            if best_j is not None and best_dist < 80 ** 2:
                 self.objects[oid] = centroids[best_j]
                 self.lost[oid] = 0
-                used_objs.add(oid)
                 used_dets.add(best_j)
-                matches.append((oid, j))
+                matches.append((oid, best_j))
 
         # New objects
         for j, c in enumerate(centroids):
             if j not in used_dets:
-                oid = self.next_id
-                self.next_id += 1
+                oid = self.next_id; self.next_id += 1
                 self.objects[oid] = c
                 self.lost[oid] = 0
                 matches.append((oid, j))
@@ -542,19 +588,13 @@ class CentroidTracker:
         return self.objects, self.history
 
 def point_line_side(p: Tuple[int, int], a: Tuple[int, int], b: Tuple[int, int]) -> float:
-    """Return sign indicating which side of line AB the point P lies."""
     (x, y), (x1, y1), (x2, y2) = p, a, b
     return (x - x1) * (y2 - y1) - (y - y1) * (x2 - x1)
 
 def segment_length_pixels(a: Tuple[int, int], b: Tuple[int, int]) -> float:
-    """Euclidean length in pixels between two points."""
     return math.hypot(b[0] - a[0], b[1] - a[1])
 
 def estimate_speed_mph(track: deque, px_to_ft: Optional[float]) -> Optional[float]:
-    """
-    Very rough speed estimate using the last 5 frames of centroid motion.
-    Requires prior calibration to convert pixels to feet.
-    """
     if px_to_ft is None or len(track) < 5:
         return None
     (t1, x1, y1) = track[-5]
@@ -568,7 +608,6 @@ def estimate_speed_mph(track: deque, px_to_ft: Optional[float]) -> Optional[floa
     return fps * 0.681818  # 1 ft/s = 0.681818 mph
 
 def draw_line(img, a: Tuple[int, int], b: Tuple[int, int], label: str) -> None:
-    """Draw a labeled line on the frame."""
     cv2.line(img, a, b, (255, 255, 255), 2)
     cv2.circle(img, a, 4, (255, 255, 255), -1)
     cv2.circle(img, b, 4, (255, 255, 255), -1)
@@ -584,19 +623,11 @@ def _backend_is_interactive() -> bool:
 
 class RealTimeChart:
     """
-    Simple dual-axis (counts vs speeds) real-time chart.
-
-    Left axis:
-      - cumulative cars A
-      - cumulative cars B
-    Right axis:
-      - ongoing (running) average mph A
-      - ongoing (running) average mph B
-      - fastest mph A
-      - fastest mph B
+    Dual-axis (counts vs speeds) chart that polls LiveStats on a GUI timer.
+    Left axis: cumulative cars A/B
+    Right axis: running avg mph A/B + fastest mph A/B
     """
-
-    def __init__(self) -> None:
+    def __init__(self, interval_sec: float = 0.25):
         plt.ion()
         self.fig, self.ax1 = plt.subplots(constrained_layout=True)
         self.ax2 = self.ax1.twinx()
@@ -611,8 +642,8 @@ class RealTimeChart:
 
         (self.l_countA,) = self.ax1.plot([], [], label="A cars (cum)")
         (self.l_countB,) = self.ax1.plot([], [], label="B cars (cum)")
-        (self.l_avgA,) = self.ax2.plot([], [], label="A avg mph")
-        (self.l_avgB,) = self.ax2.plot([], [], label="B avg mph")
+        (self.l_avgA,)  = self.ax2.plot([], [], label="A avg mph")
+        (self.l_avgB,)  = self.ax2.plot([], [], label="B avg mph")
         (self.l_fastA,) = self.ax2.plot([], [], label="A fastest mph")
         (self.l_fastB,) = self.ax2.plot([], [], label="B fastest mph")
 
@@ -620,39 +651,39 @@ class RealTimeChart:
         self.ax1.set_ylabel("Cars (cumulative)")
         self.ax2.set_ylabel("Speed (mph)")
         self.ax1.grid(True, alpha=0.3)
-
-        # Separate legends to avoid overlap
         self.ax1.legend(loc="upper left")
         self.ax2.legend(loc="upper right")
 
-        # Give the window a clear title; show non-blocking
         try:
             self.fig.canvas.manager.set_window_title("SmartWay: Live Chart")
         except Exception:
             pass
         if not _backend_is_interactive():
-            print(f"[chart] Warning: Matplotlib backend '{plt.get_backend()}' is not interactive. "
-                  f"Set MPLBACKEND=TkAgg (or install tkinter/Qt).")
+            print(f"[chart] Warning: Matplotlib backend '{plt.get_backend()}' may not be interactive.")
+
+        self._stats: Optional[LiveStats] = None
+        self._t0 = time.time()
+        self._timer = self.fig.canvas.new_timer(interval=int(interval_sec*1000))
+        self._timer.add_callback(self._on_timer)
+        self._timer.start()
         plt.show(block=False)
 
-    def push(
-        self,
-        t: float,
-        countA: int,
-        countB: int,
-        avgA: Optional[float],
-        avgB: Optional[float],
-        fastA: Optional[float],
-        fastB: Optional[float],
-    ) -> None:
-        """Append one time step to the chart."""
-        self.x.append(t)
-        self.countA.append(countA)
-        self.countB.append(countB)
-        self.avgA.append(avgA if avgA is not None else np.nan)
-        self.avgB.append(avgB if avgB is not None else np.nan)
-        self.fastA.append(fastA if fastA is not None else np.nan)
-        self.fastB.append(fastB if fastB is not None else np.nan)
+    def bind_stats(self, stats: LiveStats):
+        self._stats = stats
+
+    def _on_timer(self):
+        if not self._stats:
+            return
+        s = self._stats.snapshot()
+        avgA = (s["sumA"]/s["nA"]) if s["nA"]>0 else np.nan
+        avgB = (s["sumB"]/s["nB"]) if s["nB"]>0 else np.nan
+
+        t = time.time() - self._t0
+        self.x.append(t if not self.x else self.x[-1] + 0.0001)  # ensure monotonic
+        self.countA.append(s["A"]); self.countB.append(s["B"])
+        self.avgA.append(avgA);     self.avgB.append(avgB)
+        self.fastA.append(s["fastA"] if s["fastA"] is not None else np.nan)
+        self.fastB.append(s["fastB"] if s["fastB"] is not None else np.nan)
 
         self.l_countA.set_data(self.x, self.countA)
         self.l_countB.set_data(self.x, self.countB)
@@ -664,11 +695,6 @@ class RealTimeChart:
         self.ax1.relim(); self.ax1.autoscale_view()
         self.ax2.relim(); self.ax2.autoscale_view()
         self.fig.canvas.draw_idle()
-        try:
-            self.fig.canvas.flush_events()
-        except Exception:
-            pass
-        plt.pause(0.001)
 
 # --------------------------------------------------------------------
 # Video helpers & CLI
@@ -793,26 +819,13 @@ def main() -> None:
     calib: Optional[Tuple[Tuple[int, int], Tuple[int, int], float]] = None  # (p1, p2, px_to_ft)
     setting_mode: Optional[str] = None
     clicks: List[Tuple[int, int]] = []
-
-    # Counts & tracker
-    counts = {"A": 0, "B": 0}
     crossed = set()  # (object_id, 'A'/'B')
     tracker = CentroidTracker(max_lost=30)
 
-    # Cumulative stats for real-time chart
-    cum = {
-        "A": 0,
-        "B": 0,            # cumulative counts (cars)
-        "sumA": 0.0,
-        "sumB": 0.0,       # sums of speeds at crossings
-        "nA": 0,
-        "nB": 0,           # number of speed samples
-        "fastA": None,
-        "fastB": None,     # fastest mph so far
-    }
-    chart = RealTimeChart()
-    t0 = time.time()
-    last_chart = 0.0  # throttle chart updates
+    # Stats + chart (timer-driven)
+    stats = LiveStats()
+    chart = RealTimeChart(interval_sec=args.chart_interval)
+    chart.bind_stats(stats)
 
     # Mouse input
     def on_mouse(event, x, y, flags, param):
@@ -821,12 +834,10 @@ def main() -> None:
             clicks.append((x, y))
             if setting_mode == "A" and len(clicks) == 2:
                 lineA = (clicks[0], clicks[1])
-                clicks = []
-                setting_mode = None
+                clicks = []; setting_mode = None
             elif setting_mode == "B" and len(clicks) == 2:
                 lineB = (clicks[0], clicks[1])
-                clicks = []
-                setting_mode = None
+                clicks = []; setting_mode = None
             elif setting_mode == "K" and len(clicks) == 2:
                 p1, p2 = clicks
                 px = segment_length_pixels(p1, p2)
@@ -842,8 +853,7 @@ def main() -> None:
                         print("Invalid calibration.")
                 except Exception:
                     print("Invalid number.")
-                clicks = []
-                setting_mode = None
+                clicks = []; setting_mode = None
 
     cv2.namedWindow("SmartWay")  # autosize to frame
     cv2.setMouseCallback("SmartWay", on_mouse)
@@ -853,132 +863,109 @@ def main() -> None:
     print("  k : calibrate for speed (click 2 points spanning known distance, then enter feet)")
     print("  q : quit\n")
 
-    while True:
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            time.sleep(0.2)
-            continue
+    # Start reader thread
+    reader = FrameReader(cap).start()
 
-        ts = time.time()
-        fg = backsub.apply(frame)
-        fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, kernel, iterations=1)
-        contours, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    try:
+        while True:
+            frame = reader.get()
+            if frame is None:
+                # No fresh frame; let GUIs breathe
+                plt.pause(0.001)
+                cv2.waitKey(1)
+                continue
 
-        dets: List[Tuple[int, int, int, int]] = []
-        for cnt in contours:
-            x, y, w, h = cv2.boundingRect(cnt)
-            if w * h > 500 and h > 18 and w > 18:
-                dets.append((x, y, w, h))
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            ts = time.time()
+            fg = backsub.apply(frame)
+            fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, kernel, iterations=1)
+            contours, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        objects, history = tracker.update(dets, ts)
+            dets: List[Tuple[int, int, int, int]] = []
+            for cnt in contours:
+                x, y, w, h = cv2.boundingRect(cnt)
+                if w * h > 500 and h > 18 and w > 18:
+                    dets.append((x, y, w, h))
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-        if lineA:
-            draw_line(frame, lineA[0], lineA[1], "Dir A")
-        if lineB:
-            draw_line(frame, lineB[0], lineB[1], "Dir B")
-        if calib:
-            cv2.line(frame, calib[0], calib[1], (0, 0, 0), 2)
-            cv2.putText(frame, "Calibrated", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+            objects, history = tracker.update(dets, ts)
 
-        # Draw IDs and detect crossings
-        for oid, (cx, cy) in objects.items():
-            cv2.putText(frame, f"ID{oid}", (cx + 5, cy - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+            if lineA: draw_line(frame, lineA[0], lineA[1], "Dir A")
+            if lineB: draw_line(frame, lineB[0], lineB[1], "Dir B")
+            if calib:
+                cv2.line(frame, calib[0], calib[1], (0, 0, 0), 2)
+                cv2.putText(frame, "Calibrated", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
 
-            # Crossings for A
-            if lineA and len(history[oid]) >= 2:
-                side_now = point_line_side((cx, cy), lineA[0], lineA[1])
-                _, px_prev, py_prev = history[oid][-2]
-                side_prev = point_line_side((px_prev, py_prev), lineA[0], lineA[1])
-                if side_now * side_prev < 0:
-                    key = (oid, "A")
-                    if key not in crossed:
-                        counts["A"] += 1
-                        crossed.add(key)
-                        mph_cross = estimate_speed_mph(history[oid], calib[2]) if calib else None
-                        cum["A"] += 1
-                        if mph_cross is not None:
-                            cum["sumA"] += mph_cross
-                            cum["nA"] += 1
-                            cum["fastA"] = mph_cross if cum["fastA"] is None else max(cum["fastA"], mph_cross)
+            # Draw IDs and detect crossings
+            for oid, (cx, cy) in objects.items():
+                cv2.putText(frame, f"ID{oid}", (cx + 5, cy - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
 
-            # Crossings for B
-            if lineB and len(history[oid]) >= 2:
-                side_now = point_line_side((cx, cy), lineB[0], lineB[1])
-                _, px_prev, py_prev = history[oid][-2]
-                side_prev = point_line_side((px_prev, py_prev), lineB[0], lineB[1])
-                if side_now * side_prev < 0:
-                    key = (oid, "B")
-                    if key not in crossed:
-                        counts["B"] += 1
-                        crossed.add(key)
-                        mph_cross = estimate_speed_mph(history[oid], calib[2]) if calib else None
-                        cum["B"] += 1
-                        if mph_cross is not None:
-                            cum["sumB"] += mph_cross
-                            cum["nB"] += 1
-                            cum["fastB"] = mph_cross if cum["fastB"] is None else max(cum["fastB"], mph_cross)
+                # Crossings for A
+                if lineA and len(history[oid]) >= 2:
+                    side_now = point_line_side((cx, cy), lineA[0], lineA[1])
+                    _, px_prev, py_prev = history[oid][-2]
+                    side_prev = point_line_side((px_prev, py_prev), lineA[0], lineA[1])
+                    if side_now * side_prev < 0:
+                        key = (oid, "A")
+                        if key not in crossed:
+                            crossed.add(key)
+                            mph_cross = estimate_speed_mph(history[oid], calib[2]) if calib else None
+                            stats.add_crossing("A", mph_cross)
 
-        # Heads-up overlay (counts)
-        cv2.putText(
-            frame,
-            f"Counts A:{counts['A']}  B:{counts['B']}",
-            (10, frame.shape[0] - 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 0, 0),
-            2,
-        )
+                # Crossings for B
+                if lineB and len(history[oid]) >= 2:
+                    side_now = point_line_side((cx, cy), lineB[0], lineB[1])
+                    _, px_prev, py_prev = history[oid][-2]
+                    side_prev = point_line_side((px_prev, py_prev), lineB[0], lineB[1])
+                    if side_now * side_prev < 0:
+                        key = (oid, "B")
+                        if key not in crossed:
+                            crossed.add(key)
+                            mph_cross = estimate_speed_mph(history[oid], calib[2]) if calib else None
+                            stats.add_crossing("B", mph_cross)
 
-        # Scale the frame for display if requested
-        scale = args.display_scale if args.display_scale and args.display_scale > 0 else 1.0
-        disp_frame = frame
-        if scale != 1.0:
-            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
-            disp_frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=interp)
-
-        cv2.imshow("SmartWay", disp_frame)
-
-        # Update the live chart (ongoing avg, cumulative counts, fastest)
-        now = time.time()
-        if now - last_chart >= args.chart_interval:
-            avgA = (cum["sumA"] / cum["nA"]) if cum["nA"] > 0 else None
-            avgB = (cum["sumB"] / cum["nB"]) if cum["nB"] > 0 else None
-            chart.push(
-                now - t0,
-                cum["A"],
-                cum["B"],
-                avgA,
-                avgB,
-                cum["fastA"],
-                cum["fastB"],
+            # Heads-up overlay (counts from stats snapshot)
+            s = stats.snapshot()
+            cv2.putText(
+                frame,
+                f"Counts A:{s['A']}  B:{s['B']}",
+                (10, frame.shape[0] - 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 0, 0),
+                2,
             )
-            last_chart = now
 
-        # Key handling
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            break
-        elif key == ord("d"):
-            if not lineA:
-                print("Click two points for Direction A line.")
-                setting_mode = "A"
-                clicks = []
-            elif not lineB:
-                print("Click two points for Direction B line.")
-                setting_mode = "B"
-                clicks = []
-            else:
-                print("Both lines set. Press 'd' again to redefine.")
-                lineA = None
-                lineB = None
-        elif key == ord("k"):
-            print("Click two points spanning a known real-world distance (feet)…")
-            setting_mode = "K"
-            clicks = []
+            # Scale the frame for display if requested
+            scale = args.display_scale if args.display_scale and args.display_scale > 0 else 1.0
+            disp_frame = frame
+            if scale != 1.0:
+                interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+                disp_frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=interp)
 
-    cap.release()
-    cv2.destroyAllWindows()
+            cv2.imshow("SmartWay", disp_frame)
+
+            # Key handling
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+            elif key == ord("d"):
+                if not lineA:
+                    print("Click two points for Direction A line.")
+                    setting_mode = "A"; clicks = []
+                elif not lineB:
+                    print("Click two points for Direction B line.")
+                    setting_mode = "B"; clicks = []
+                else:
+                    print("Both lines set. Press 'd' again to redefine.")
+                    lineA = None; lineB = None
+            elif key == ord("k"):
+                print("Click two points spanning a known real-world distance (feet)…")
+                setting_mode = "K"; clicks = []
+
+    finally:
+        reader.stop()
+        cap.release()
+        cv2.destroyAllWindows()
 
 # --------------------------------------------------------------------
 
