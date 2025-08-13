@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TDOT SmartWay - Nearby Camera Selection, Lightweight Vehicle Counting,
+TDOT SmartWay – Nearby Camera Selection, Lightweight Vehicle Counting,
 and Real-time Charting of Counts & Speeds.
 
 Author: Rob Lee
-Contributors:
-License: MIT 
+Contributors: ChatGPT (assistant)
+License: MIT (or your preferred license)
 
 Description
 -----------
 - Discovers the TDOT OpenData API key from SmartWay's `config.prod.json`.
 - Fetches roadway camera metadata and selects the nearest cameras.
+- Falls back to a cached camera inventory on 204/empty responses.
 - Opens the selected camera stream (or snapshot) and runs a simple motion-based tracker.
 - Draws two user-defined direction lines (A and B) for crossing counts.
-- Supports a two-point pixelfeet calibration to estimate speed.
+- Supports a two-point pixel→feet calibration to estimate speed.
 - Displays a real-time chart with:
     * ongoing (running) average speed in direction A
     * ongoing (running) average speed in direction B
@@ -37,7 +38,16 @@ Change History
                 - Pull TDOT apiBaseUrl from config.prod.json when available
                 - Harden API key handling (never confuse Google Maps key)
                 - Add real-time chart for ongoing averages, cumulative counts, fastest speeds
-                - Remove unused variables and minor dead code
+                - Add --display-scale to control window size by scaling frames
+2025-08-12  RL  Robust camera fetch:
+                - Handle 204/empty responses with short backoff and cache-busting retries
+                - Try multiple auth styles (query/header/x-api-key) and $format=json fallback
+                - Add camera inventory cache (.tdot_cameras_cache.json) and fallback
+                - Add --no-cache-fallback to disable cache usage
+2025-08-12  RL  Chart display reliability:
+                - Force interactive Matplotlib backend (TkAgg/Qt5Agg) before pyplot import
+                - Call plt.show(block=False) after creating figure
+                - Flush GUI events each update; set window title
 """
 
 from __future__ import annotations
@@ -48,16 +58,27 @@ import os
 import re
 import time
 from collections import deque
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import cv2
-import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter, Retry
 from urllib.parse import urljoin
+
+# ---- Matplotlib backend selection (must be BEFORE pyplot import) ----
+# Try to ensure an interactive backend so a chart window actually appears.
+import matplotlib as _mpl
+if not os.environ.get("MPLBACKEND"):  # allow user override
+    try:
+        _mpl.use("TkAgg", force=True)
+    except Exception:
+        try:
+            _mpl.use("Qt5Agg", force=True)
+        except Exception:
+            # Fall back to whatever is available; we'll warn later if non-interactive.
+            pass
+import matplotlib.pyplot as plt
 
 # --------------------------------------------------------------------
 # Constants (TDOT / SmartWay)
@@ -72,7 +93,8 @@ TDOT_BASES_FALLBACK: List[str] = [
 ]
 
 TDOT_CAMERAS_RESOURCE = "RoadwayCameras"  # per config
-APIKEY_CACHE_FILE = ".smartway_api_key.txt"  # caches *TDOT OpenData* apiKey only (not Google Maps keys)
+APIKEY_CACHE_FILE = ".smartway_api_key.txt"          # caches *TDOT OpenData* apiKey only
+CAMS_CACHE_FILE   = ".tdot_cameras_cache.json"       # caches last-good raw camera payload (list of dicts)
 
 # Typical browser-ish headers (helpful, but not strictly required)
 DEFAULT_HEADERS: Dict[str, str] = {
@@ -123,25 +145,60 @@ def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * R * math.asin(math.sqrt(a))
 
 # --------------------------------------------------------------------
-# API key cache + validation
+# Small file cache helpers
 # --------------------------------------------------------------------
 
-def _read_cached_key() -> Optional[str]:
-    """Read cached TDOT OpenData apiKey (if any)."""
+def _read_text(path: str) -> Optional[str]:
     try:
-        with open(APIKEY_CACHE_FILE, "r", encoding="utf-8") as f:
-            k = f.read().strip()
-            return k or None
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
     except FileNotFoundError:
         return None
+    except Exception:
+        return None
 
-def _write_cached_key(key: str) -> None:
-    """Write TDOT OpenData apiKey to cache."""
+def _write_text(path: str, text: str) -> None:
     try:
-        with open(APIKEY_CACHE_FILE, "w", encoding="utf-8") as f:
-            f.write(key.strip())
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
     except Exception:
         pass
+
+def _read_cached_key() -> Optional[str]:
+    txt = _read_text(APIKEY_CACHE_FILE)
+    return txt.strip() if txt else None
+
+def _write_cached_key(key: str) -> None:
+    if key:
+        _write_text(APIKEY_CACHE_FILE, key.strip())
+
+def _read_cams_cache(debug: bool = False) -> Optional[List[Dict[str, Any]]]:
+    import json
+    txt = _read_text(CAMS_CACHE_FILE)
+    if not txt:
+        return None
+    try:
+        data = json.loads(txt)
+        if isinstance(data, list):
+            if debug:
+                print(f"[cache] Loaded {len(data)} cameras from {CAMS_CACHE_FILE}")
+            return data
+    except Exception:
+        pass
+    return None
+
+def _write_cams_cache(raw_items: List[Dict[str, Any]], debug: bool = False) -> None:
+    import json
+    try:
+        _write_text(CAMS_CACHE_FILE, json.dumps(raw_items, ensure_ascii=False))
+        if debug:
+            print(f"[cache] Saved {len(raw_items)} cameras to {CAMS_CACHE_FILE}")
+    except Exception:
+        pass
+
+# --------------------------------------------------------------------
+# API key validation
+# --------------------------------------------------------------------
 
 def _is_google_maps_key(key: str) -> bool:
     """Heuristic: Google Maps browser keys typically start with 'AIza'."""
@@ -160,11 +217,6 @@ def _is_probably_tdot_key(key: str) -> bool:
 def load_tdot_config(debug: bool = False) -> Tuple[Optional[str], Optional[str]]:
     """
     Load SmartWay config JSON and return (api_base_url, api_key).
-
-    Returns
-    -------
-    (api_base_url, api_key) : Tuple[str|None, str|None]
-        Either/both may be None if not present or fetch failed.
     """
     try:
         s = session_with_retries()
@@ -174,7 +226,7 @@ def load_tdot_config(debug: bool = False) -> Tuple[Optional[str], Optional[str]]
         api_base = cfg.get("apiBaseUrl") or cfg.get("apiBaseURL") or cfg.get("baseUrl")
         api_key = cfg.get("apiKey")
         if debug:
-            print(f"[config] apiBaseUrl={api_base}  apiKey={('present' if api_key else 'missing')}")
+            print(f"[config] apiBaseUrl={api_base}  apiKey={'present' if api_key else 'missing'}")
         return api_base, api_key
     except Exception as e:
         if debug:
@@ -185,10 +237,9 @@ def get_tdot_api_key(debug: bool = False, force_refresh: bool = False) -> Option
     """
     Resolve the TDOT OpenData apiKey from (in order):
       1) Environment variable SMARTWAY_API_KEY (if not a Google Maps key)
-      2) Cache file (ignoring Google Maps keys)  <-- check cache early to avoid noisy DNS errors
+      2) Cache file (ignoring Google Maps keys)
       3) SmartWay config.prod.json (authoritative source)
     """
-    # 1) Environment override
     env_key = os.getenv("SMARTWAY_API_KEY")
     if env_key and not _is_google_maps_key(env_key):
         if debug:
@@ -196,7 +247,6 @@ def get_tdot_api_key(debug: bool = False, force_refresh: bool = False) -> Option
         _write_cached_key(env_key)
         return env_key
 
-    # 2) Cache (unless we are explicitly forcing a refresh)
     if not force_refresh:
         cached = _read_cached_key()
         if cached and not _is_google_maps_key(cached):
@@ -206,7 +256,6 @@ def get_tdot_api_key(debug: bool = False, force_refresh: bool = False) -> Option
         elif cached and _is_google_maps_key(cached) and debug:
             print(f"[apikey] Ignoring cached Google Maps key in {APIKEY_CACHE_FILE}")
 
-    # 3) Fetch from config (preferred authoritative source)
     api_base, api_key = load_tdot_config(debug=debug)
     if api_key and _is_probably_tdot_key(api_key):
         if debug:
@@ -215,11 +264,10 @@ def get_tdot_api_key(debug: bool = False, force_refresh: bool = False) -> Option
         return api_key
     elif debug and api_key and _is_google_maps_key(api_key):
         print("[apikey] Config provided a Google Maps key; ignoring for OpenData.")
-
     return None
 
 # --------------------------------------------------------------------
-# Camera fetch
+# Camera fetch (robust)
 # --------------------------------------------------------------------
 
 def _candidate_bases(debug: bool = False) -> List[str]:
@@ -229,13 +277,10 @@ def _candidate_bases(debug: bool = False) -> List[str]:
     api_base, _ = load_tdot_config(debug=debug)
     bases: List[str] = []
     if api_base:
-        # Ensure trailing slash for urljoin behavior
         if not api_base.endswith("/"):
             api_base = api_base + "/"
         bases.append(api_base)
-    # Add fallbacks
     bases.extend(TDOT_BASES_FALLBACK)
-    # Deduplicate preserving order
     seen: set = set()
     uniq = [b for b in bases if not (b in seen or seen.add(b))]
     if debug:
@@ -265,16 +310,27 @@ def _decode_json_or_log(r: requests.Response, debug: bool, url: str) -> Optional
                 print(f"[cams] Snippet={text[:240]!r}")
         return None
 
-def fetch_cameras(debug_key: bool = False) -> List[Dict]:
+def fetch_cameras(debug_key: bool = False, allow_cache_fallback: bool = True) -> List[Dict]:
     """
     Fetch camera metadata from TDOT OpenData and normalize key fields.
-    Retries multiple auth styles and adds $format=json fallback if needed.
+    Retries multiple auth styles, handles 204/empty responses with cache-busting,
+    and adds $format=json fallback if needed. If all attempts fail and a cached
+    inventory exists, returns the cached inventory.
+
+    Parameters
+    ----------
+    debug_key : bool
+        Verbose logs for key/config/fetch flow.
+    allow_cache_fallback : bool
+        If True, load last-good camera list from cache when live fetch fails.
     """
+    import json
+
     api_key = get_tdot_api_key(debug=debug_key)  # may be None if config failed
     s = session_with_retries()
 
     last_err: Optional[Exception] = None
-    cams: Optional[List[Dict]] = None
+    raw_items: Optional[List[Dict[str, Any]]] = None
 
     for base in _candidate_bases(debug=debug_key):
         url = urljoin(base, TDOT_CAMERAS_RESOURCE)
@@ -298,6 +354,23 @@ def fetch_cameras(debug_key: bool = False) -> List[Dict]:
                 if debug_key:
                     print(f"[cams] GET {url} params={params} ({label})")
                 r = s.get(url, timeout=30, params=params, headers=hdrs)
+
+                # Treat 204/empty as transient; retry with short backoff and cache-buster
+                if r.status_code == 204 or not (r.text or r.content):
+                    if debug_key:
+                        print(f"[cams] 204/empty from {r.url}; retrying with cache-buster…")
+                    tried_nonempty = False
+                    for _ in range(2):  # up to 2 extra tries
+                        time.sleep(0.6)
+                        p2 = dict(params)
+                        p2["_"] = str(int(time.time() * 1000))  # cache-buster query param
+                        r2 = s.get(url, timeout=30, params=p2, headers=hdrs)
+                        if r2.status_code not in (204,) and (r2.text or r2.content):
+                            r = r2
+                            tried_nonempty = True
+                            break
+                    if not tried_nonempty and debug_key:
+                        print(f"[cams] Still empty after cache-buster tries.")
 
                 # auth/permission handling
                 if r.status_code in (401, 403):
@@ -337,9 +410,14 @@ def fetch_cameras(debug_key: bool = False) -> List[Dict]:
                     last_err = ValueError("Non-JSON or empty response")
                     continue
 
-                cams = items
+                # Success
+                if not isinstance(items, list):
+                    last_err = ValueError(f"Unexpected JSON shape: {type(items)}")
+                    continue
+
+                raw_items = items
                 if debug_key:
-                    print(f"[cams] OK {r.status_code}: received {len(cams)} cameras from {r.url}")
+                    print(f"[cams] OK {r.status_code}: received {len(raw_items)} cameras from {r.url}")
                 break
 
             except Exception as e:
@@ -347,15 +425,25 @@ def fetch_cameras(debug_key: bool = False) -> List[Dict]:
                 if debug_key:
                     print(f"[cams] Failed {url} ({label}): {e}")
 
-        if cams:
+        if raw_items:
             break  # success for this base
 
-    if not cams:
-        raise RuntimeError(f"Failed to fetch cameras from TDOT OpenData. Last error: {last_err}")
+    # Cache or fallback
+    if raw_items:
+        _write_cams_cache(raw_items, debug=debug_key)
+    else:
+        if allow_cache_fallback:
+            cached = _read_cams_cache(debug=debug_key)
+            if cached:
+                raw_items = cached
+                if debug_key:
+                    print("[cams] Using cached camera inventory due to live fetch failure.")
+        if not raw_items:
+            raise RuntimeError(f"Failed to fetch cameras from TDOT OpenData. Last error: {last_err}")
 
     # Normalize fields needed downstream
     out: List[Dict] = []
-    for c in cams:
+    for c in raw_items:
         lat = c.get("lat") or c.get("latitude")
         lng = c.get("lng") or c.get("longitude") or c.get("lon")
         stream = (
@@ -382,20 +470,6 @@ def fetch_cameras(debug_key: bool = False) -> List[Dict]:
 
     out = [c for c in out if c["active"] and c["_stream"]]
     return out
-
-def nearest_cameras(
-    cams: List[Dict], lat: float, lon: float, max_items: int = 8, max_miles: float = 5.0
-) -> List[Dict]:
-    """
-    Return up to `max_items` cameras within `max_miles`, sorted by distance.
-    """
-    scored: List[Tuple[float, Dict]] = []
-    for c in cams:
-        d = haversine(lat, lon, c["lat"], c["lng"])
-        if d <= max_miles:
-            scored.append((d, c))
-    scored.sort(key=lambda x: x[0])
-    return [c for _, c in scored[:max_items]]
 
 # --------------------------------------------------------------------
 # Lightweight tracker & speed helpers
@@ -438,7 +512,7 @@ class CentroidTracker:
                 self.lost[oid] = 0
                 used_objs.add(oid)
                 used_dets.add(best_j)
-                matches.append((oid, best_j))
+                matches.append((oid, j))
 
         # New objects
         for j, c in enumerate(centroids):
@@ -504,6 +578,10 @@ def draw_line(img, a: Tuple[int, int], b: Tuple[int, int], label: str) -> None:
 # Real-time chart – counts (left axis) and speeds (right axis)
 # --------------------------------------------------------------------
 
+def _backend_is_interactive() -> bool:
+    b = plt.get_backend().lower()
+    return any(key in b for key in ("qt", "tk", "wx", "gtk", "macosx"))
+
 class RealTimeChart:
     """
     Simple dual-axis (counts vs speeds) real-time chart.
@@ -520,7 +598,7 @@ class RealTimeChart:
 
     def __init__(self) -> None:
         plt.ion()
-        self.fig, self.ax1 = plt.subplots()
+        self.fig, self.ax1 = plt.subplots(constrained_layout=True)
         self.ax2 = self.ax1.twinx()
 
         self.x: List[float] = []
@@ -546,6 +624,16 @@ class RealTimeChart:
         # Separate legends to avoid overlap
         self.ax1.legend(loc="upper left")
         self.ax2.legend(loc="upper right")
+
+        # Give the window a clear title; show non-blocking
+        try:
+            self.fig.canvas.manager.set_window_title("SmartWay: Live Chart")
+        except Exception:
+            pass
+        if not _backend_is_interactive():
+            print(f"[chart] Warning: Matplotlib backend '{plt.get_backend()}' is not interactive. "
+                  f"Set MPLBACKEND=TkAgg (or install tkinter/Qt).")
+        plt.show(block=False)
 
     def push(
         self,
@@ -573,11 +661,13 @@ class RealTimeChart:
         self.l_fastA.set_data(self.x, self.fastA)
         self.l_fastB.set_data(self.x, self.fastB)
 
-        self.ax1.relim()
-        self.ax1.autoscale_view()
-        self.ax2.relim()
-        self.ax2.autoscale_view()
+        self.ax1.relim(); self.ax1.autoscale_view()
+        self.ax2.relim(); self.ax2.autoscale_view()
         self.fig.canvas.draw_idle()
+        try:
+            self.fig.canvas.flush_events()
+        except Exception:
+            pass
         plt.pause(0.001)
 
 # --------------------------------------------------------------------
@@ -608,17 +698,42 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--auto", action="store_true", help="Auto-select nearest camera without prompting")
     p.add_argument("--api-key", help="(Optional) TDOT OpenData apiKey; else pulled from config & cached")
     p.add_argument("--debug-key", action="store_true", help="Print debug logs during apiKey discovery")
-    p.add_argument("--chart-interval", type=float, default=0.25, help="Seconds between chart updates")
-    p.add_argument("--display-scale", type=float, default=1.0, help="Scale factor for the video window (e.g., 0.75 for 75%% size, 1.5 to upscale).")
-
+    p.add_argument(
+        "--chart-interval",
+        type=float,
+        default=0.25,
+        help="Seconds between live chart updates (e.g., 0.25).",
+    )
+    p.add_argument(
+        "--display-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for the video window (e.g., 0.75 for 75%% size, 1.5 to upscale).",
+    )
+    p.add_argument(
+        "--no-cache-fallback",
+        action="store_true",
+        help="Do not use cached camera list when TDOT API returns 204/empty.",
+    )
     return p.parse_args()
 
 # --------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------
 
+def nearest_cameras(cams, lat, lon, max_items=8, max_miles=5.0):
+    scored = []
+    for c in cams:
+        d = haversine(lat, lon, c["lat"], c["lng"])
+        if d <= max_miles:
+            scored.append((d, c))
+    scored.sort(key=lambda x: x[0])
+    return [c for _, c in scored[:max_items]]
+
 def main() -> None:
     args = parse_args()
+
+    print(f"[chart] Matplotlib backend: {plt.get_backend()}")
 
     # If provided a key, use it (but ignore Google Maps keys)
     if args.api_key and not _is_google_maps_key(args.api_key):
@@ -626,14 +741,17 @@ def main() -> None:
         _write_cached_key(args.api_key)
 
     print("Fetching cameras…")
-    cams = fetch_cameras(debug_key=args.debug_key)
-    nearby = nearest_cameras(cams, args.lat, args.lon, max_items=8, max_miles=args.radius)
+    cams = fetch_cameras(
+        debug_key=args.debug_key,
+        allow_cache_fallback=not args.no_cache_fallback
+    )
 
+    # Choose a camera near the given point
+    nearby = nearest_cameras(cams, args.lat, args.lon, max_items=8, max_miles=args.radius)
     if not nearby:
         print("No cameras found within radius. Try increasing --radius.")
         return
 
-    # Select camera
     if args.camera_id:
         cam = next((c for c in cams if str(c["id"]) == str(args.camera_id)), None)
         if not cam:
@@ -727,7 +845,7 @@ def main() -> None:
                 clicks = []
                 setting_mode = None
 
-    cv2.namedWindow("SmartWay")
+    cv2.namedWindow("SmartWay")  # autosize to frame
     cv2.setMouseCallback("SmartWay", on_mouse)
 
     print("\nControls:")
@@ -812,13 +930,13 @@ def main() -> None:
             2,
         )
 
-        # Scale the frame for display if requested (Option B)
+        # Scale the frame for display if requested
         scale = args.display_scale if args.display_scale and args.display_scale > 0 else 1.0
         disp_frame = frame
         if scale != 1.0:
             interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
             disp_frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=interp)
-        
+
         cv2.imshow("SmartWay", disp_frame)
 
         # Update the live chart (ongoing avg, cumulative counts, fastest)
@@ -861,6 +979,8 @@ def main() -> None:
 
     cap.release()
     cv2.destroyAllWindows()
+
+# --------------------------------------------------------------------
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,6 @@
+# Virtual environment (at repo root)
+.venv/
+
+# Any files or directories beginning with .smart or .tdot (any depth)
+.smart*
+.tdot*
