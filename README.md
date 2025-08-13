@@ -315,10 +315,3 @@ flowchart TD
 This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file or the header in source files.
 
 ---
-
-### What I changed (so you can diff quickly)
-
-* Mermaid node **J**: `J[Estimate mph (optional calibration)]` → `J[Estimate mph - optional calibration]` (no inner parentheses).
-* Replaced corrupted `pixelsfeet` with `pixels→feet`.
-* Cleaned the file tree and corrected the filename to `smartway_counter.py`.
-* Kept everything UTF-8-clean to avoid rendering glitches.
