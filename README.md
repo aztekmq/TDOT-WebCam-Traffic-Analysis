@@ -28,6 +28,9 @@ It is **not** intended for safety-critical use. Accuracy depends on scene qualit
 * **Live chart** (Matplotlib): running avg A/B, cumulative counts A/B, fastest A/B.
 * Robust HTTP session with retries for flaky endpoints.
 
+**Example – Live chart window:**
+![Live chart showing cumulative counts and speed metrics](images/LiveChart.png)
+
 ---
 
 ## Requirements & Standards
@@ -190,11 +193,20 @@ python smartway_counter.py --api-key YOUR_TDOT_OPENDATA_KEY
 python smartway_counter.py --debug-key
 ```
 
+### Interactive camera selection (when no `--lat/--lon`)
+
+If you start without `--lat` and `--lon` (and no `--camera-id`), a pop-up selector lets you **search, sort, and filter** the camera list. Click a row to use that camera’s coordinates and continue.
+
+![“Select a TDOT Camera” searchable dialog](images/SelectCamera.png)
+
 **Controls (while the video window is focused):**
 
 * `d` – define direction lines (click 2 points for **A**; press `d` again and click 2 for **B**)
 * `k` – calibrate (click 2 points spanning known distance, then enter **feet**)
 * `q` – quit
+
+**Example – Video window with detections and overlay:**
+![Live traffic view with tracked IDs and counts overlay](images/LiveTraffic.png)
 
 ---
 
