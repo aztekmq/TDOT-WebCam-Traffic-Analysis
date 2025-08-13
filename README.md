@@ -24,7 +24,7 @@ It is **not** intended for safety-critical use. Accuracy depends on scene qualit
 * Finds **nearest cameras** using Haversine distance.
 * Opens common streams (HLS/MJPEG/RTSP) via OpenCV (FFmpeg recommended).
 * **Two direction lines** (A, B) for crossing counts.
-* **Two-point** calibration (pixels ↔ feet) to estimate **mph**.
+* **Two-point** calibration (pixels → feet) to estimate **mph**.
 * **Live chart** (Matplotlib): running avg A/B, cumulative counts A/B, fastest A/B.
 * Robust HTTP session with retries for flaky endpoints.
 
@@ -91,9 +91,7 @@ pip install opencv-python matplotlib numpy pandas requests
 Matplotlib’s interactive chart window uses a GUI toolkit. With **Method A**, we use **TkAgg**, which requires **tkinter**.
 
 * **Windows (python.org Python):** tkinter is typically included. If you installed Python via the **Microsoft Store**, tkinter may be missing — reinstall from python.org.
-* **Windows (if missing):**
-
-  * Add/repair Python installation and ensure **tcl/tk** feature is enabled.
+* **Windows (if missing):** add/repair Python installation and enable **tcl/tk**.
 * **Ubuntu/Debian:**
 
   ```bash
@@ -232,10 +230,10 @@ If you start without `--lat` and `--lon` (and no `--camera-id`), a pop-up select
 
 ```
 .
-├── smartway_count.py           # Main script (this project)
-├── .smartway_api_key.txt       # Local cache of TDOT OpenData key (optional)
-├── requirements.txt            # Python dependencies (recommended)
-└── README.md                   # You are here
+|-- smartway_counter.py         # Main script (this project)
+|-- .smartway_api_key.txt       # Local cache of TDOT OpenData key (optional)
+|-- requirements.txt            # Python dependencies (recommended)
+`-- README.md                   # You are here
 ```
 
 Suggested `requirements.txt`:
@@ -254,19 +252,33 @@ requests
 
 ```mermaid
 flowchart TD
-    A[Load SmartWay config.prod.json] -->|apiBaseUrl, apiKey| B(Session with retries)
-    B --> C[Fetch RoadwayCameras]
-    C --> D[Filter/normalize cameras]
-    D --> E[Nearest cameras by Haversine]
-    E --> F[OpenCV video stream]
-    F --> G[Background subtractor + morphology]
-    G --> H[Centroid tracker + histories]
-    H --> I[Crossing detection vs lines A/B]
-    I --> J[Estimate mph (optional calibration)]
-    I --> K[Counts A/B (cumulative)]
-    J --> L[Running averages + fastest]
-    K --> M[Live Matplotlib chart]
-    L --> M
+  A[Load SmartWay config.prod.json]
+  B[Session with retries]
+  C[Fetch RoadwayCameras]
+  D[Normalize cameras]
+  E[Nearest cameras by Haversine]
+  F[OpenCV video stream]
+  G[Background subtraction + morphology]
+  H[Centroid tracker + histories]
+  I[Crossing detection vs lines A and B]
+  J[Estimate mph - optional calibration]
+  K[Counts A and B - cumulative]
+  L[Running averages and fastest]
+  M[Live Matplotlib chart]
+
+  A -->|apiBaseUrl + apiKey| B
+  B --> C
+  C --> D
+  D --> E
+  E --> F
+  F --> G
+  G --> H
+  H --> I
+  I --> J
+  I --> K
+  J --> L
+  K --> M
+  L --> M
 ```
 
 ---
@@ -282,14 +294,13 @@ flowchart TD
 
 ## Troubleshooting
 
-* **No chart window / `ModuleNotFoundError: No module named 'tkinter'`:**
-  Install tkinter (**Method A**) — see “GUI backend for charts” above.
-* **Stream won’t open:** Verify `ffmpeg -version`. Try `--display-scale 0.75`. Try a different camera.
-* **401/403:** Old/incorrect key. Delete `.smartway_api_key.txt` and rerun with `--debug-key`.
-* **Google Maps key detected:** Keys starting with `AIza` are **ignored** for OpenData.
-* **No cameras found:** Increase `--radius` or adjust `--lat/--lon`.
-* **Laggy chart:** Increase `--chart-interval` (e.g., 0.5–1.0).
-* **Inaccurate speed:** Re-calibrate with longer pixel span; ensure points align with roadway plane.
+* **No chart window / `ModuleNotFoundError: No module named 'tkinter'`:** install tkinter (**Method A**) — see “GUI backend for charts” above.
+* **Stream won’t open:** verify `ffmpeg -version`. Try `--display-scale 0.75`. Try a different camera.
+* **401/403:** old/incorrect key. Delete `.smartway_api_key.txt` and rerun with `--debug-key`.
+* **Google Maps key detected:** keys starting with `AIza` are **ignored** for OpenData.
+* **No cameras found:** increase `--radius` or adjust `--lat/--lon`.
+* **Laggy chart:** increase `--chart-interval` (e.g., 0.5–1.0).
+* **Inaccurate speed:** re-calibrate with longer pixel span; ensure points align with roadway plane.
 
 ---
 
@@ -318,3 +329,5 @@ flowchart TD
 ## License
 
 This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file or the header in source files.
+
+---
