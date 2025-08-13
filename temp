@@ -1,3 +1,11 @@
+Make the following updates to my code, do not break any other functionalities:
+
+1. if lat and lon parms are not passed in from cmdline upon startup, then present the user with a pop-up dialog, containing a type-ahead searchable table of cameras to select from. let the user sort, filter, search for one, then once it's clicked, get 
+it's lat, lon details and proceed as normal.
+
+
+My current code is below:
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -53,10 +61,6 @@ Change History
                 - Add LiveStats (thread-safe) for counts/speeds
                 - Make chart timer-driven (polls stats; no per-frame mpl work)
                 - Integrate threading path into main loop
-2025-08-13  RL  Camera picker UI:
-                - If --lat/--lon are omitted, show a Tkinter pop-up with type-ahead search
-                  and sortable table of cameras; pick one to set lat/lon and proceed.
-                - Console fallback picker when tkinter is unavailable.
 """
 
 from __future__ import annotations
@@ -105,7 +109,6 @@ TDOT_BASES_FALLBACK: List[str] = [
 TDOT_CAMERAS_RESOURCE = "RoadwayCameras"  # per config
 APIKEY_CACHE_FILE = ".smartway_api_key.txt"          # caches *TDOT OpenData* apiKey only
 CAMS_CACHE_FILE   = ".tdot_cameras_cache.json"       # caches last-good raw camera payload (list of dicts)
-TotalCamerasFound = 0
 
 # Typical browser-ish headers (helpful, but not strictly required)
 DEFAULT_HEADERS: Dict[str, str] = {
@@ -200,12 +203,10 @@ def _read_cams_cache(debug: bool = False) -> Optional[List[Dict[str, Any]]]:
 
 def _write_cams_cache(raw_items: List[Dict[str, Any]], debug: bool = False) -> None:
     import json
-    global TotalCamerasFound  # Declare global to modify it    
     try:
-        TotalCamerasFound = len(raw_items)  # Update global variable
         _write_text(CAMS_CACHE_FILE, json.dumps(raw_items, ensure_ascii=False))
         if debug:
-            print(f"[cache] Saved {TotalCamerasFound} cameras to {CAMS_CACHE_FILE}")
+            print(f"[cache] Saved {len(raw_items)} cameras to {CAMS_CACHE_FILE}")
     except Exception:
         pass
 
@@ -724,11 +725,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="TDOT SmartWay vehicle counting with real-time charting."
     )
-    # NOTE: default None so we can trigger the picker when omitted.
-    p.add_argument("--lat", type=float, default=None,
-                   help="Latitude. If omitted, a camera picker pop-up appears.")
-    p.add_argument("--lon", type=float, default=None,
-                   help="Longitude. If omitted, a camera picker pop-up appears.")
+    p.add_argument("--lat", type=float, default=36.1602364)
+    p.add_argument("--lon", type=float, default=-86.7619816)
     p.add_argument("--radius", type=float, default=5.0, help="Miles search radius")
     p.add_argument("--camera-id", type=str, help="Use this camera ID directly")
     p.add_argument("--auto", action="store_true", help="Auto-select nearest camera without prompting")
@@ -752,148 +750,6 @@ def parse_args() -> argparse.Namespace:
         help="Do not use cached camera list when TDOT API returns 204/empty.",
     )
     return p.parse_args()
-
-# --------------------------------------------------------------------
-# Camera picker UI (Tkinter) + console fallback
-# --------------------------------------------------------------------
-
-def pick_camera_gui(cams: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """
-    Show a Tkinter dialog with search box and sortable table of cameras.
-    Returns the selected camera dict or None if canceled.
-    """
-    try:
-        import tkinter as tk
-        from tkinter import ttk
-    except Exception:
-        return None  # signal to use console fallback
-
-    root = tk.Tk()
-    root.title(f"Select a TDOT Camera - {TotalCamerasFound} Found")
-    root.geometry("900x520")
-    root.minsize(700, 420)
-
-    # --- Top: Search bar
-    frm_top = ttk.Frame(root); frm_top.pack(fill="x", padx=10, pady=(10, 6))
-    ttk.Label(frm_top, text="Search:").pack(side="left")
-    var_search = tk.StringVar()
-    ent = ttk.Entry(frm_top, textvariable=var_search); ent.pack(side="left", fill="x", expand=True, padx=(8, 0))
-
-    # --- Center: Treeview
-    cols = ("id", "title", "lat", "lng")
-    tree = ttk.Treeview(root, columns=cols, show="headings", selectmode="browse")
-    vsb = ttk.Scrollbar(root, orient="vertical", command=tree.yview)
-    hsb = ttk.Scrollbar(root, orient="horizontal", command=tree.xview)
-    tree.configure(yscroll=vsb.set, xscroll=hsb.set)
-    tree.pack(fill="both", expand=True, padx=10, pady=4)
-    vsb.place(in_=tree, relx=1.0, rely=0, relheight=1.0, anchor="ne", width=16)
-    hsb.pack(fill="x", padx=10, pady=(0, 6))
-
-    # Column headings
-    headings = {
-        "id": "ID",
-        "title": "Title",
-        "lat": "Latitude",
-        "lng": "Longitude",
-    }
-    widths = {"id": 100, "title": 520, "lat": 120, "lng": 120}
-    for c in cols:
-        tree.heading(c, text=headings[c], command=lambda c=c: sort_by(c))
-        tree.column(c, width=widths[c], anchor="w")
-
-    # Copy of items for filtering/sorting
-    items = list(cams)
-    shown: List[Dict[str, Any]] = []
-
-    def refresh():
-        query = var_search.get().strip().lower()
-        tree.delete(*tree.get_children())
-        shown.clear()
-        for cam in items:
-            sid = str(cam.get("id", ""))
-            title = str(cam.get("title", ""))
-            lat = cam.get("lat")
-            lng = cam.get("lng")
-            text_blob = f"{sid} {title}".lower()
-            if query in text_blob:
-                tree.insert("", "end", iid=sid, values=(sid, title, f"{lat:.6f}", f"{lng:.6f}"))
-                shown.append(cam)
-
-    sort_state = {"col": "title", "asc": True}
-
-    def sort_by(col: str):
-        asc = sort_state["col"] != col or not sort_state["asc"]
-        sort_state["col"], sort_state["asc"] = col, asc
-        def key(cam):
-            v = cam.get(col)
-            if col in ("lat", "lng"):
-                try: return float(v)
-                except Exception: return 0.0
-            return str(v).lower()
-        items.sort(key=key, reverse=not asc)
-        refresh()
-
-    refresh()
-
-    selected: Dict[str, Any] = {}
-    def on_ok():
-        sel = tree.selection()
-        if not sel:
-            return
-        sid = sel[0]
-        # Find in shown
-        cam = next((c for c in shown if str(c.get("id")) == sid), None)
-        if cam:
-            selected.update(cam)
-            root.destroy()
-
-    def on_cancel():
-        root.destroy()
-
-    def on_double(event=None):
-        on_ok()
-
-    # Bottom buttons
-    frm_btn = ttk.Frame(root); frm_btn.pack(fill="x", padx=10, pady=(0, 10))
-    btn_ok = ttk.Button(frm_btn, text="OK", command=on_ok)
-    btn_ok.pack(side="right")
-    ttk.Button(frm_btn, text="Cancel", command=on_cancel).pack(side="right", padx=(0, 8))
-
-    tree.bind("<Double-1>", on_double)
-    ent.bind("<KeyRelease>", lambda e: refresh())
-    ent.focus_set()
-    root.mainloop()
-
-    return selected or None
-
-def pick_camera_console(cams: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """
-    Console fallback: simple search + choose by ID.
-    """
-    print("\n[Picker] tkinter not available. Falling back to console picker.")
-    print("Type a search substring (title or id), or just press Enter to list first 30:")
-    q = input("Search: ").strip().lower()
-    matches = []
-    for c in cams:
-        blob = f"{c.get('id')} {c.get('title','')}".lower()
-        if not q or q in blob:
-            matches.append(c)
-        if len(matches) >= 30 and not q:
-            break
-    if not matches:
-        print("No matches.")
-        return None
-    print("\nMatches:")
-    for c in matches[:50]:
-        print(f"  id={c.get('id')}  {c.get('title','')}  (lat={c.get('lat'):.6f}, lon={c.get('lng'):.6f})")
-    sel = input("\nEnter camera id (or blank to cancel): ").strip()
-    if not sel:
-        return None
-    cam = next((c for c in cams if str(c.get("id")) == sel), None)
-    if not cam:
-        print("Invalid id.")
-        return None
-    return cam
 
 # --------------------------------------------------------------------
 # Main
@@ -924,21 +780,7 @@ def main() -> None:
         allow_cache_fallback=not args.no_cache_fallback
     )
 
-    # If lat/lon omitted → open picker to choose any camera; we then
-    # set args.lat/lon from the chosen camera and proceed as normal.
-    if args.lat is None or args.lon is None:
-        cam_pick = pick_camera_gui(cams)
-        if cam_pick is None:
-            cam_pick = pick_camera_console(cams)
-        if not cam_pick:
-            print("No camera selected. Exiting.")
-            return
-        args.lat = float(cam_pick["lat"])
-        args.lon = float(cam_pick["lng"])
-        print(f"Selected camera for starting point: id={cam_pick['id']}  {cam_pick['title']}")
-        print(f"Using lat/lon = ({args.lat:.6f}, {args.lon:.6f})")
-
-    # Choose a camera near the given (possibly picker-provided) point
+    # Choose a camera near the given point
     nearby = nearest_cameras(cams, args.lat, args.lon, max_items=8, max_miles=args.radius)
     if not nearby:
         print("No cameras found within radius. Try increasing --radius.")
